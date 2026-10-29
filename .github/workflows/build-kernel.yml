@@ -2,6 +2,9 @@ name: Build kernel (stone 5.4 + Droidspaces backports)
 
 # Taruh file ini di: .github/workflows/build-kernel.yml pada FORK repo kernel kamu.
 # Jalankan dari tab Actions -> "Build kernel ..." -> Run workflow.
+#
+# Tips: centang "patch_only" untuk hanya menguji penerapan patch (sekitar 1 menit),
+# tanpa memasang toolchain dan tanpa build.
 
 on:
   workflow_dispatch:
@@ -12,6 +15,14 @@ on:
         default: "moonstone_defconfig"
       apply_backports:
         description: "Terapkan Droidspaces/droidspaces-backports (kernel-5.4-series)"
+        type: boolean
+        default: true
+      patch_only:
+        description: "Hanya terapkan patch lalu berhenti (tanpa toolchain dan build)"
+        type: boolean
+        default: false
+      relax_context:
+        description: "Kalau patch gagal, coba ulang dengan konteks dilonggarkan (git am -C2/-C1)"
         type: boolean
         default: true
       skip_patches:
@@ -51,41 +62,6 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Bebaskan ruang disk
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost || true
-          df -h /
-
-      - name: Pasang dependensi build
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential bc bison flex libssl-dev libelf-dev libncurses-dev \
-            python3 cpio lz4 xz-utils zstd zip unzip git curl \
-            clang lld llvm \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
-
-      - name: Pakai clang kustom (opsional)
-        if: ${{ inputs.clang_url != '' }}
-        env:
-          CLANG_URL: ${{ inputs.clang_url }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/toolchain/clang"
-          curl -fsSL "$CLANG_URL" -o "$RUNNER_TEMP/clang.tar"
-          tar -xf "$RUNNER_TEMP/clang.tar" -C "$HOME/toolchain/clang"
-          CLANG_BIN="$(dirname "$(find "$HOME/toolchain/clang" -type f -name clang -path '*/bin/*' | head -n1)")"
-          echo "Clang kustom: $CLANG_BIN"
-          echo "$CLANG_BIN" >> "$GITHUB_PATH"
-
-      - name: Versi toolchain
-        run: |
-          clang --version | head -n1
-          ld.lld --version | head -n1
-          llvm-ar --version | head -n1
-          aarch64-linux-gnu-gcc --version | head -n1
-          arm-linux-gnueabi-gcc --version | head -n1
-
       - name: Ambil droidspaces-backports
         if: ${{ inputs.apply_backports }}
         run: |
@@ -95,14 +71,19 @@ jobs:
         if: ${{ inputs.apply_backports }}
         env:
           SKIP_PATCHES: ${{ inputs.skip_patches }}
+          RELAX_CONTEXT: ${{ inputs.relax_context }}
         run: |
           set -euo pipefail
           BP="$RUNNER_TEMP/backports"
           SER="$BP/kernel-5.4-series"
           PROBE="$RUNNER_TEMP/probe.txt"
+          DIAG="$RUNNER_TEMP/patch-diagnostics.txt"
+          APPLIED_DIFF="$RUNNER_TEMP/applied.diff"
+          : > "$DIAG"
 
           git config user.name  "kernel-ci"
           git config user.email "kernel-ci@localhost"
+          BASE_SHA="$(git rev-parse HEAD)"
 
           echo "== Probe =="
           bash "$BP/tools/probe-kernel.sh" "$GITHUB_WORKSPACE" 2>&1 | tee "$PROBE" || true
@@ -117,8 +98,189 @@ jobs:
             [0006]="close_range"
           )
 
+          # Coba terapkan satu patch. Mengisi METHOD dengan cara yang berhasil.
+          # Skrip edit fs/open.c untuk faccessat2. Dipakai sebagai fallback patch 0004
+          # kalau konteks fs/open.c berbeda (hook KernelSU/vendor di do_faccessat).
+          OPEN_C_PY="$RUNNER_TEMP/faccessat2_open_c.py"
+          cat > "$OPEN_C_PY" <<'PYEOF'
+          #!/usr/bin/env python3
+          """Tambahkan faccessat2 ke fs/open.c (kernel 5.4) tanpa bergantung pada konteks patch.
+
+          Gaya sama dengan backport Droidspaces: blok credential override tidak diubah,
+          AT_EACCESS melompat melewatinya dengan `goto retry`, dan `out:` hanya
+          mengembalikan credential kalau override memang dipasang.
+
+          Aman terhadap hook vendor/KernelSU di dalam do_faccessat(). Kalau ada anchor yang
+          tidak ditemukan persis satu kali, skrip berhenti tanpa mengubah file.
+          """
+          import re
+          import sys
+
+
+          def die(msg):
+              print("ERROR:", msg, file=sys.stderr)
+              sys.exit(1)
+
+
+          def sub1(text, old, new, what):
+              n = text.count(old)
+              if n != 1:
+                  die("anchor '%s' ditemukan %d kali (harus 1)" % (what, n))
+              return text.replace(old, new)
+
+
+          if len(sys.argv) != 2:
+              die("pemakaian: faccessat2_open_c.py <fs/open.c>")
+
+          path = sys.argv[1]
+          src = open(path, encoding="utf-8").read()
+
+          if "SYSCALL_DEFINE4(faccessat2" in src:
+              die("faccessat2 sudah ada di %s" % path)
+
+          head_old = "long do_faccessat(int dfd, const char __user *filename, int mode)\n{"
+          start = src.find(head_old)
+          if start < 0:
+              die("definisi do_faccessat() versi 3 argumen tidak ditemukan")
+          end = src.find("\nSYSCALL_DEFINE3(faccessat,", start)
+          if end < 0:
+              die("SYSCALL_DEFINE3(faccessat, ...) tidak ditemukan")
+
+          func = src[start:end]
+
+          func = sub1(
+              func,
+              head_old,
+              "static long do_faccessat(int dfd, const char __user *filename, int mode, int flags)\n{",
+              "kepala fungsi",
+          )
+          func = sub1(func, "\tconst struct cred *old_cred;\n",
+                      "\tconst struct cred *old_cred = NULL;\n", "old_cred")
+          func = sub1(func, "\tstruct cred *override_cred;\n",
+                      "\tstruct cred *override_cred = NULL;\n", "override_cred")
+
+          # Cek mode: sisipkan validasi flags sebelum, dan penanganan flags sesudahnya.
+          # Regex dipakai supaya tidak bergantung pada spasi/tab sebelum komentar.
+          pat = re.compile(r"(\tif \(mode & ~S_IRWXO\)[^\n]*\n\t\treturn -EINVAL;\n)")
+          if len(pat.findall(func)) != 1:
+              die("cek `mode & ~S_IRWXO` tidak ditemukan tepat satu kali")
+
+          PRE = (
+              "\tif (flags & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))\n"
+              "\t\treturn -EINVAL;\n"
+              "\n"
+          )
+          POST = (
+              "\n"
+              "\tif (flags & AT_SYMLINK_NOFOLLOW)\n"
+              "\t\tlookup_flags &= ~LOOKUP_FOLLOW;\n"
+              "\tif (flags & AT_EMPTY_PATH)\n"
+              "\t\tlookup_flags |= LOOKUP_EMPTY;\n"
+              "\n"
+              "\t/* AT_EACCESS: pakai effective ID, jadi lewati override ke real ID */\n"
+              "\tif (flags & AT_EACCESS)\n"
+              "\t\tgoto retry;\n"
+          )
+          func = pat.sub(lambda m: PRE + m.group(1) + POST, func)
+
+          func = sub1(
+              func,
+              "\trevert_creds(old_cred);\n\tput_cred(override_cred);\n\treturn res;\n}",
+              "\tif (old_cred) {\n\t\trevert_creds(old_cred);\n\t\tput_cred(override_cred);\n\t}\n\treturn res;\n}",
+              "bagian out:",
+          )
+
+          src = src[:start] + func + src[end:]
+
+          src = sub1(
+              src,
+              "\treturn do_faccessat(dfd, filename, mode);\n}\n",
+              "\treturn do_faccessat(dfd, filename, mode, 0);\n}\n"
+              "\n"
+              "SYSCALL_DEFINE4(faccessat2, int, dfd, const char __user *, filename, int, mode,\n"
+              "\t\tint, flags)\n"
+              "{\n"
+              "\treturn do_faccessat(dfd, filename, mode, flags);\n"
+              "}\n",
+              "SYSCALL faccessat",
+          )
+          src = sub1(
+              src,
+              "\treturn do_faccessat(AT_FDCWD, filename, mode);\n",
+              "\treturn do_faccessat(AT_FDCWD, filename, mode, 0);\n",
+              "SYSCALL access",
+          )
+
+          calls = len(re.findall(r"\bdo_faccessat\(", src))
+          if calls != 4:  # definisi + faccessat + faccessat2 + access
+              die("jumlah pemakaian do_faccessat() tidak terduga: %d (harus 4)" % calls)
+
+          open(path, "w", encoding="utf-8").write(src)
+          print("OK: faccessat2 ditambahkan ke", path)
+          PYEOF
+
+          # Fallback 0004: terapkan bagian patch selain fs/open.c, lalu edit fs/open.c lewat skrip.
+          apply_faccessat2_fallback() {
+            local p="$1"
+            if ! git am --exclude=fs/open.c "$p"; then
+              git am --abort || true
+              return 1
+            fi
+            if ! python3 "$OPEN_C_PY" fs/open.c; then
+              git reset -q --hard HEAD~1
+              return 1
+            fi
+            git add fs/open.c
+            git commit -q --amend --no-edit
+          }
+
+          METHOD=""
+          try_apply() {
+            local p="$1" num="$2" c
+            METHOD=""
+            if git am "$p"; then return 0; fi
+            git am --abort || true
+            if [ "$num" = "0004" ]; then
+              echo "Coba ulang: patch tanpa fs/open.c + edit fs/open.c lewat skrip"
+              if apply_faccessat2_fallback "$p"; then METHOD="skrip-open.c"; return 0; fi
+            fi
+            if [ "$RELAX_CONTEXT" = "true" ]; then
+              for c in 2 1; do
+                echo "Coba ulang dengan konteks dilonggarkan (-C$c)"
+                if git am -C"$c" "$p"; then METHOD="-C$c"; return 0; fi
+                git am --abort || true
+              done
+            fi
+            echo "Coba ulang dengan --3way"
+            if git am --3way "$p"; then METHOD="3way"; return 0; fi
+            git am --abort || true
+            return 1
+          }
+
+          # Cetak info untuk mendiagnosis patch yang gagal.
+          diagnose() {
+            local p="$1"
+            {
+              echo "===== Patch gagal: $(basename "$p") ====="
+              echo "--- git apply --check -v ---"
+              git apply --check -v "$p" 2>&1 || true
+              echo "--- hunk yang ditolak (git apply --reject) ---"
+              git apply --reject --whitespace=nowarn "$p" 2>&1 || true
+              find . -name '*.rej' -not -path './.git/*' -print -exec cat {} \; || true
+              git reset -q --hard HEAD
+              find . \( -name '*.rej' -o -name '*.orig' \) -not -path './.git/*' -delete || true
+              if grep -q '^+++ b/fs/open.c' "$p"; then
+                echo "--- fs/open.c baris 380-520 ---"
+                nl -ba fs/open.c | sed -n '380,520p'
+                echo "--- hook ksu/susfs/sdcardfs di fs/open.c ---"
+                grep -nEi 'ksu|susfs|sdcardfs' fs/open.c || echo "(tidak ada)"
+              fi
+            } 2>&1 | tee -a "$DIAG"
+          }
+
           APPLIED=""
           SKIPPED=""
+          RELAXED=""
           for n in 0001 0002 0003 0004 0005 0006; do
             patch="$(compgen -G "$SER/${n}-*.patch" | head -n1 || true)"
             if [ -z "$patch" ]; then
@@ -138,28 +300,50 @@ jobs:
             fi
 
             echo "APPLY $name"
-            if git am "$patch"; then
-              APPLIED="$APPLIED $n"
-            else
-              git am --abort || true
-              echo "Coba ulang dengan --3way"
-              if git am --3way "$patch"; then
-                APPLIED="$APPLIED $n(3way)"
+            if try_apply "$patch" "$n"; then
+              if [ -n "$METHOD" ]; then
+                APPLIED="$APPLIED $n($METHOD)"
+                RELAXED="$RELAXED $n"
+                echo "::warning::Patch $n tidak lewat jalur standar (metode: $METHOD). Periksa hasilnya di ringkasan job / artifact applied.diff."
               else
-                git am --abort || true
-                echo "::error::Patch $name gagal. Lihat Documentation/Porting.md di droidspaces-backports, lalu jalankan ulang dengan skip_patches atau perbaiki manual."
-                find . -name '*.rej' -print || true
-                exit 1
+                APPLIED="$APPLIED $n"
               fi
+            else
+              diagnose "$patch"
+              {
+                echo "### Patch $n gagal"
+                echo '```'
+                cat "$DIAG"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::Patch $name gagal. Lihat ringkasan job / artifact patch-info, atau Documentation/Porting.md di droidspaces-backports. Bisa juga rerun dengan skip_patches."
+              git diff "$BASE_SHA"..HEAD > "$APPLIED_DIFF" || true
+              exit 1
             fi
           done
+
+          git diff "$BASE_SHA"..HEAD > "$APPLIED_DIFF" || true
 
           {
             echo "### Droidspaces backports"
             echo "- Diterapkan: ${APPLIED:-tidak ada}"
             echo "- Dilewati: ${SKIPPED:-tidak ada}"
             echo "- Patch 0007 (x86) tidak dipakai"
+            if [ -n "$RELAXED" ]; then
+              echo "- PERHATIAN: patch$RELAXED tidak lewat jalur standar (lihat metode di atas). Periksa diff di bawah."
+            fi
             echo
+            git diff --stat "$BASE_SHA"..HEAD | sed 's/^/    /'
+            echo
+            if [ -n "$RELAXED" ]; then
+              echo '<details><summary>Diff fs/open.c</summary>'
+              echo
+              echo '```diff'
+              git diff "$BASE_SHA"..HEAD -- fs/open.c
+              echo '```'
+              echo '</details>'
+              echo
+            fi
             echo '<details><summary>Output probe</summary>'
             echo
             echo '```'
@@ -168,7 +352,57 @@ jobs:
             echo '</details>'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Upload info patch
+        if: ${{ always() && inputs.apply_backports }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-info-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/probe.txt
+            ${{ runner.temp }}/applied.diff
+            ${{ runner.temp }}/patch-diagnostics.txt
+          if-no-files-found: ignore
+
+      - name: Bebaskan ruang disk
+        if: ${{ !inputs.patch_only }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost || true
+          df -h /
+
+      - name: Pasang dependensi build
+        if: ${{ !inputs.patch_only }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev libncurses-dev \
+            python3 cpio lz4 xz-utils zstd zip unzip git curl \
+            clang lld llvm \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Pakai clang kustom (opsional)
+        if: ${{ !inputs.patch_only && inputs.clang_url != '' }}
+        env:
+          CLANG_URL: ${{ inputs.clang_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/toolchain/clang"
+          curl -fsSL "$CLANG_URL" -o "$RUNNER_TEMP/clang.tar"
+          tar -xf "$RUNNER_TEMP/clang.tar" -C "$HOME/toolchain/clang"
+          CLANG_BIN="$(dirname "$(find "$HOME/toolchain/clang" -type f -name clang -path '*/bin/*' | head -n1)")"
+          echo "Clang kustom: $CLANG_BIN"
+          echo "$CLANG_BIN" >> "$GITHUB_PATH"
+
+      - name: Versi toolchain
+        if: ${{ !inputs.patch_only }}
+        run: |
+          clang --version | head -n1
+          ld.lld --version | head -n1
+          llvm-ar --version | head -n1
+          aarch64-linux-gnu-gcc --version | head -n1
+          arm-linux-gnueabi-gcc --version | head -n1
+
       - name: Tentukan defconfig
+        if: ${{ !inputs.patch_only }}
         env:
           INPUT_DEFCONFIG: ${{ inputs.defconfig }}
         run: |
@@ -206,6 +440,7 @@ jobs:
           echo "DEFCONFIG=$cfg" >> "$GITHUB_ENV"
 
       - name: Konfigurasi kernel
+        if: ${{ !inputs.patch_only }}
         env:
           CONTAINER_CONFIGS: ${{ inputs.container_configs }}
           DISABLE_LTO: ${{ inputs.disable_lto }}
@@ -250,12 +485,14 @@ jobs:
           fi
 
       - name: Build kernel
+        if: ${{ !inputs.patch_only }}
         run: |
           set -euo pipefail
           make $KMAKE_ARGS -j"$(nproc)" 2>&1 | tee build.log
           make $KMAKE_ARGS -s kernelrelease | tee kernelrelease.txt
 
       - name: Kumpulkan hasil build
+        if: ${{ !inputs.patch_only }}
         run: |
           set -euo pipefail
           OUT=out/arch/arm64/boot
@@ -267,6 +504,7 @@ jobs:
           cp out/.config dist/config
           cp kernelrelease.txt dist/
           [ -f "$RUNNER_TEMP/probe.txt" ] && cp "$RUNNER_TEMP/probe.txt" dist/probe.txt || true
+          [ -f "$RUNNER_TEMP/applied.diff" ] && cp "$RUNNER_TEMP/applied.diff" dist/applied.diff || true
 
           if ! ls dist/Image* >/dev/null 2>&1; then
             echo "::error::Tidak ada file Image di $OUT"
@@ -276,18 +514,18 @@ jobs:
           echo "- Kernel: $(cat kernelrelease.txt)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload hasil build
+        if: ${{ !inputs.patch_only }}
         uses: actions/upload-artifact@v4
         with:
           name: kernel-stone-5.4-droidspaces-${{ github.run_number }}
           path: dist/
           if-no-files-found: error
 
-      - name: Upload log (jika gagal)
-        if: ${{ failure() }}
+      - name: Upload log build (jika gagal)
+        if: ${{ failure() && !inputs.patch_only }}
         uses: actions/upload-artifact@v4
         with:
           name: build-logs-${{ github.run_number }}
           path: |
             build.log
-            ${{ runner.temp }}/probe.txt
           if-no-files-found: ignore
