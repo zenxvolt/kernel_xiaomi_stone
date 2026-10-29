@@ -1,0 +1,293 @@
+name: Build kernel (stone 5.4 + Droidspaces backports)
+
+# Taruh file ini di: .github/workflows/build-kernel.yml pada FORK repo kernel kamu.
+# Jalankan dari tab Actions -> "Build kernel ..." -> Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig relatif terhadap arch/arm64/configs (kosong = deteksi otomatis *stone*)"
+        required: false
+        default: "moonstone_defconfig"
+      apply_backports:
+        description: "Terapkan Droidspaces/droidspaces-backports (kernel-5.4-series)"
+        type: boolean
+        default: true
+      skip_patches:
+        description: "Paksa lewati patch tertentu, pisahkan spasi (contoh: 0005 0006)"
+        required: false
+        default: ""
+      container_configs:
+        description: "Aktifkan CONFIG dasar untuk container/systemd"
+        type: boolean
+        default: true
+      disable_lto:
+        description: "Matikan LTO/CFI/ShadowCallStack (build lebih cepat, aman untuk clang dari apt)"
+        type: boolean
+        default: true
+      clang_url:
+        description: "URL tarball clang kustom (opsional, kosong = clang bawaan Ubuntu)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      KMAKE_ARGS: >-
+        O=out ARCH=arm64 LLVM=1
+        CROSS_COMPILE=aarch64-linux-gnu-
+        CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+        CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+    steps:
+      - name: Checkout source kernel
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Bebaskan ruang disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost || true
+          df -h /
+
+      - name: Pasang dependensi build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev libncurses-dev \
+            python3 cpio lz4 xz-utils zstd zip unzip git curl \
+            clang lld llvm \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Pakai clang kustom (opsional)
+        if: ${{ inputs.clang_url != '' }}
+        env:
+          CLANG_URL: ${{ inputs.clang_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/toolchain/clang"
+          curl -fsSL "$CLANG_URL" -o "$RUNNER_TEMP/clang.tar"
+          tar -xf "$RUNNER_TEMP/clang.tar" -C "$HOME/toolchain/clang"
+          CLANG_BIN="$(dirname "$(find "$HOME/toolchain/clang" -type f -name clang -path '*/bin/*' | head -n1)")"
+          echo "Clang kustom: $CLANG_BIN"
+          echo "$CLANG_BIN" >> "$GITHUB_PATH"
+
+      - name: Versi toolchain
+        run: |
+          clang --version | head -n1
+          ld.lld --version | head -n1
+          llvm-ar --version | head -n1
+          aarch64-linux-gnu-gcc --version | head -n1
+          arm-linux-gnueabi-gcc --version | head -n1
+
+      - name: Ambil droidspaces-backports
+        if: ${{ inputs.apply_backports }}
+        run: |
+          git clone --depth 1 https://github.com/Droidspaces/droidspaces-backports "$RUNNER_TEMP/backports"
+
+      - name: Probe kernel dan terapkan patch (kernel-5.4-series)
+        if: ${{ inputs.apply_backports }}
+        env:
+          SKIP_PATCHES: ${{ inputs.skip_patches }}
+        run: |
+          set -euo pipefail
+          BP="$RUNNER_TEMP/backports"
+          SER="$BP/kernel-5.4-series"
+          PROBE="$RUNNER_TEMP/probe.txt"
+
+          git config user.name  "kernel-ci"
+          git config user.email "kernel-ci@localhost"
+
+          echo "== Probe =="
+          bash "$BP/tools/probe-kernel.sh" "$GITHUB_WORKSPACE" 2>&1 | tee "$PROBE" || true
+
+          # patch -> fitur yang dicek probe (0007 khusus x86, tidak dipakai di arm64)
+          declare -A FEATURE=(
+            [0001]="STATX_MNT_ID"
+            [0002]="STATX_ATTR_MOUNT_ROOT"
+            [0003]="utimensat_AT_EMPTY_PATH"
+            [0004]="faccessat2"
+            [0005]="close_range"
+            [0006]="close_range"
+          )
+
+          APPLIED=""
+          SKIPPED=""
+          for n in 0001 0002 0003 0004 0005 0006; do
+            patch="$(compgen -G "$SER/${n}-*.patch" | head -n1 || true)"
+            if [ -z "$patch" ]; then
+              echo "::error::Patch $n tidak ditemukan di $SER"
+              exit 1
+            fi
+            name="$(basename "$patch")"
+
+            if [[ " $SKIP_PATCHES " == *" $n "* ]]; then
+              echo "SKIP  $name (diminta manual)"; SKIPPED="$SKIPPED $n(manual)"; continue
+            fi
+            if grep -qiE "${FEATURE[$n]}.*(^|[^a-z])yes" "$PROBE"; then
+              echo "SKIP  $name (probe: ${FEATURE[$n]} sudah yes)"; SKIPPED="$SKIPPED $n(probe)"; continue
+            fi
+            if git apply --reverse --check "$patch" 2>/dev/null; then
+              echo "SKIP  $name (sudah terpasang)"; SKIPPED="$SKIPPED $n(terpasang)"; continue
+            fi
+
+            echo "APPLY $name"
+            if git am "$patch"; then
+              APPLIED="$APPLIED $n"
+            else
+              git am --abort || true
+              echo "Coba ulang dengan --3way"
+              if git am --3way "$patch"; then
+                APPLIED="$APPLIED $n(3way)"
+              else
+                git am --abort || true
+                echo "::error::Patch $name gagal. Lihat Documentation/Porting.md di droidspaces-backports, lalu jalankan ulang dengan skip_patches atau perbaiki manual."
+                find . -name '*.rej' -print || true
+                exit 1
+              fi
+            fi
+          done
+
+          {
+            echo "### Droidspaces backports"
+            echo "- Diterapkan: ${APPLIED:-tidak ada}"
+            echo "- Dilewati: ${SKIPPED:-tidak ada}"
+            echo "- Patch 0007 (x86) tidak dipakai"
+            echo
+            echo '<details><summary>Output probe</summary>'
+            echo
+            echo '```'
+            cat "$PROBE"
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tentukan defconfig
+        env:
+          INPUT_DEFCONFIG: ${{ inputs.defconfig }}
+        run: |
+          set -euo pipefail
+          CFGDIR=arch/arm64/configs
+          cfg="$INPUT_DEFCONFIG"
+
+          if [ -n "$cfg" ]; then
+            if [ ! -f "$CFGDIR/$cfg" ]; then
+              echo "::error::$CFGDIR/$cfg tidak ada. Daftar defconfig:"
+              (cd "$CFGDIR" && find . -type f | sed 's|^\./||' | sort)
+              exit 1
+            fi
+          else
+            mapfile -t cands < <(cd "$CFGDIR" && find . -type f -iname '*stone*' | sed 's|^\./||' | sort)
+            if [ "${#cands[@]}" -eq 0 ]; then
+              echo "::error::Tidak ada defconfig yang cocok dengan *stone*. Isi input 'defconfig'. Daftar:"
+              (cd "$CFGDIR" && find . -type f | sed 's|^\./||' | sort)
+              exit 1
+            elif [ "${#cands[@]}" -eq 1 ]; then
+              cfg="${cands[0]}"
+            else
+              for c in moonstone_defconfig stone_defconfig vendor/stone_defconfig; do
+                for x in "${cands[@]}"; do [ "$x" = "$c" ] && cfg="$c"; done
+              done
+              if [ -z "$cfg" ]; then
+                echo "::error::Ada beberapa kandidat, pilih satu lewat input 'defconfig':"
+                printf '  %s\n' "${cands[@]}"
+                exit 1
+              fi
+            fi
+          fi
+
+          echo "Defconfig: $cfg"
+          echo "DEFCONFIG=$cfg" >> "$GITHUB_ENV"
+
+      - name: Konfigurasi kernel
+        env:
+          CONTAINER_CONFIGS: ${{ inputs.container_configs }}
+          DISABLE_LTO: ${{ inputs.disable_lto }}
+        run: |
+          set -euo pipefail
+          make $KMAKE_ARGS "$DEFCONFIG"
+
+          if [ "$DISABLE_LTO" = "true" ]; then
+            ./scripts/config --file out/.config \
+              -d LTO_CLANG -d THINLTO -d CFI_CLANG -d CFI_PERMISSIVE \
+              -d SHADOW_CALL_STACK -d CC_WERROR -e LTO_NONE
+          fi
+
+          # Baseline umum untuk container + systemd. Daftar resmi Droidspaces:
+          # jalankan `droidspaces check` di perangkat dan tambahkan yang masih merah.
+          WANT="NAMESPACES UTS_NS IPC_NS USER_NS PID_NS NET_NS
+                CGROUPS CGROUP_PIDS CGROUP_DEVICE CGROUP_FREEZER CGROUP_CPUACCT
+                CGROUP_SCHED CPUSETS MEMCG CGROUP_BPF BPF_SYSCALL
+                DEVTMPFS TMPFS TMPFS_XATTR TMPFS_POSIX_ACL
+                FHANDLE AUTOFS4_FS SECCOMP SECCOMP_FILTER
+                POSIX_MQUEUE SYSVIPC OVERLAY_FS
+                CRYPTO_USER_API_HASH IKCONFIG IKCONFIG_PROC"
+
+          if [ "$CONTAINER_CONFIGS" = "true" ]; then
+            for c in $WANT; do ./scripts/config --file out/.config -e "$c"; done
+          fi
+
+          make $KMAKE_ARGS olddefconfig
+
+          if [ "$CONTAINER_CONFIGS" = "true" ]; then
+            echo "== Cek config yang diminta =="
+            MISSING=""
+            for c in $WANT; do
+              if ! grep -qE "^CONFIG_${c}=(y|m)$" out/.config; then
+                MISSING="$MISSING $c"
+              fi
+            done
+            if [ -n "$MISSING" ]; then
+              echo "::warning::Tidak aktif setelah olddefconfig (mungkin tidak ada di kernel ini):$MISSING"
+            fi
+            echo "- Config diminta tapi tidak aktif:${MISSING:- tidak ada}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+          make $KMAKE_ARGS -j"$(nproc)" 2>&1 | tee build.log
+          make $KMAKE_ARGS -s kernelrelease | tee kernelrelease.txt
+
+      - name: Kumpulkan hasil build
+        run: |
+          set -euo pipefail
+          OUT=out/arch/arm64/boot
+          mkdir -p dist/dtbs
+          for f in Image Image.gz Image.gz-dtb Image.lz4 Image.lz4-dtb dtbo.img; do
+            [ -f "$OUT/$f" ] && cp "$OUT/$f" dist/
+          done
+          find "$OUT/dts" -type f \( -name '*.dtb' -o -name '*.dtbo' \) -exec cp {} dist/dtbs/ \; 2>/dev/null || true
+          cp out/.config dist/config
+          cp kernelrelease.txt dist/
+          [ -f "$RUNNER_TEMP/probe.txt" ] && cp "$RUNNER_TEMP/probe.txt" dist/probe.txt || true
+
+          if ! ls dist/Image* >/dev/null 2>&1; then
+            echo "::error::Tidak ada file Image di $OUT"
+            exit 1
+          fi
+          ls -lh dist dist/dtbs
+          echo "- Kernel: $(cat kernelrelease.txt)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload hasil build
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-stone-5.4-droidspaces-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Upload log (jika gagal)
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            build.log
+            ${{ runner.temp }}/probe.txt
+          if-no-files-found: ignore
